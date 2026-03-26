@@ -91,18 +91,14 @@ func convertEUseToSQL() {
 
 	parseFloat := func(s string) float64 {
 		s = strings.TrimSpace(s)
-		print("wir haben:" + s)
 		if s == "" {
 			return 0
 		}
-		// Erst Tausenderpunkte weg, dann Komma -> Punkt
-		s = strings.ReplaceAll(s, ".", "")
-		s = strings.ReplaceAll(s, ",", ".")
+		s = strings.ReplaceAll(s, ",", "")
 		v, err := strconv.ParseFloat(s, 64)
 		if err != nil {
 			return 0
 		}
-		print("wir bekommen:" + s)
 		return v
 	}
 
@@ -129,7 +125,7 @@ func convertEUseToSQL() {
 		}
 		yearStr := strings.TrimSpace(row[0])
 		year, err := strconv.Atoi(yearStr)
-		if err != nil || year < 2000 || year > 2100 {
+		if err != nil || year < 2000 || year > 2025 {
 			continue
 		}
 

@@ -12,6 +12,6 @@ func main() {
 		convertEUseToSQL()
 		// add more later
 	case "time_to_usage":
-		diagramOfTimeToUsage()
+		diagramsOfTimeToUsage()
 	}
 }
