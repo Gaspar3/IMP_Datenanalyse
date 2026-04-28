@@ -37,7 +37,6 @@ func parseCSV(path string) ([]Question, error) {
 
 	r := csv.NewReader(f)
 	r.Comma = ';'
-	r.FieldsPerRecord = -1
 	r.LazyQuotes = true
 
 	var rows [][]string
@@ -61,9 +60,10 @@ func parseCSV(path string) ([]Question, error) {
 		if len(row) < 2 {
 			continue
 		}
-
+		fmt.Println("line:", row)
 		// Detect question header row: col1 is a number, col2 has question text
 		if col1 := strings.TrimSpace(row[0]); col1 != "" {
+			fmt.Println("Haben frage")
 			if n, err := strconv.Atoi(col1); err == nil {
 				if currentQ != nil {
 					questions = append(questions, *currentQ)
@@ -1084,7 +1084,7 @@ func makeAgreementChart(q *Question, outDir string) error {
 
 
 func diagramsOfQuestions() {
-	csvPath := "assets/csv/IMP_Projekt_ Fragebogen_Beispiel_Frage.csv"
+	csvPath := "assets/csv/IMP_Projekt_Fragebogen_Beispiel_Frage.csv"
 
 	questions, err := parseCSV(csvPath)
 	if err != nil {

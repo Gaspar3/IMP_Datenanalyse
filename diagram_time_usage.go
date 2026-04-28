@@ -197,6 +197,94 @@ func saveAllSeriesPlot(data []MonthlyData, seriesList []Series, ticks []plot.Tic
 	fmt.Println("Gespeichert:", filePath)
 }
 
+func saveCombinedPlot(data []MonthlyData, seriesList []Series, ticks []plot.Tick, title, filePath string) {
+	p := plot.New()
+	p.Title.Text = title
+	p.Title.TextStyle.Font.Size = vg.Points(16)
+	p.X.Label.Text = "Zeit"
+	p.Y.Label.Text = "Gesamtverbrauch (kWh)"
+	p.Add(plotter.NewGrid())
+	p.X.Tick.Marker = plot.ConstantTicks(ticks)
+
+	// Kumulierte Schichten berechnen
+	cumulative := make([]float64, len(data))
+	prev := make(plotter.XYs, len(data))
+	for i, d := range data {
+		prev[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: 0}
+	}
+
+	for _, s := range seriesList {
+		layer := make(plotter.XYs, len(data))
+		for i, d := range data {
+			cumulative[i] += s.getter(d)
+			layer[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: cumulative[i]}
+		}
+
+		// Gefülltes Polygon: Oberkante vorwärts + Unterkante rückwärts
+		poly := make(plotter.XYs, 2*len(data))
+		copy(poly, layer)
+		for i := range data {
+			poly[len(data)+i] = prev[len(data)-1-i]
+		}
+		polygon, err := plotter.NewPolygon(poly)
+		if err != nil {
+			log.Fatal(err)
+		}
+		c := s.color
+		c.A = 180
+		polygon.Color = c
+		polygon.LineStyle.Width = 0
+		p.Add(polygon)
+
+		// Randlinie
+		line, err := plotter.NewLine(layer)
+		if err != nil {
+			log.Fatal(err)
+		}
+		line.Color = s.color
+		line.Width = vg.Points(1)
+		p.Add(line)
+		p.Legend.Add(s.name, line)
+
+		copy(prev, layer)
+	}
+
+	totals := make(plotter.XYs, len(data))
+	for i := range data {
+		totals[i] = prev[i]
+	}
+	totalLine, err := plotter.NewLine(totals)
+	if err != nil {
+		log.Fatal(err)
+	}
+	totalLine.Color = color.RGBA{R: 0, G: 0, B: 0, A: 255}
+	totalLine.Width = vg.Points(2)
+	totalLine.Dashes = []vg.Length{vg.Points(6), vg.Points(3)}
+	p.Add(totalLine)
+	p.Legend.Add("Gesamt", totalLine)
+
+	p.Legend.Top = true
+	p.Legend.Left = false
+	p.Legend.TextStyle.Font.Size = vg.Points(9)
+
+	p.Y.Min = 0
+	maxTotal := 0.0
+	for _, pt := range totals {
+		if pt.Y > maxTotal {
+			maxTotal = pt.Y
+		}
+	}
+	if maxTotal == 0 {
+		maxTotal = 100
+	}
+	p.Y.Max = math.Ceil(maxTotal/1000) * 1000
+
+	if err := p.Save(20*vg.Centimeter, 12*vg.Centimeter, filePath); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Gespeichert:", filePath)
+}
+
 func diagramsOfTimeToUsage() {
 	db, err := sql.Open("sqlite", "assets/data/datenbank.db")
 	if err != nil {
@@ -274,6 +362,9 @@ func diagramsOfTimeToUsage() {
 		allFilePath := fmt.Sprintf("%s/all.png", dirPath)
 		allTitle := fmt.Sprintf("Alle Zähler – %d", year)
 		saveAllSeriesPlot(yearData, seriesList, ticks, allTitle, allFilePath)
+		combinedFilePath := fmt.Sprintf("%s/combined.png", dirPath)
+		combinedTitle := fmt.Sprintf("Gesamtverbrauch gestapelt – %d", year)
+		saveCombinedPlot(yearData, seriesList, ticks, combinedTitle, combinedFilePath)
 	}
 
 	// ── Alltime: Ordner + Einzeldiagramme + all.png ──
@@ -292,6 +383,8 @@ func diagramsOfTimeToUsage() {
 
 	allFilePath := fmt.Sprintf("%s/all.png", alltimePath)
 	saveAllSeriesPlot(allData, seriesList, alltimeTicks, "Alle Zähler – Gesamtzeitraum", allFilePath)
+	combinedFilePath := fmt.Sprintf("%s/combined.png", alltimePath)
+	saveCombinedPlot(allData, seriesList, alltimeTicks, "Gesamtverbrauch gestapelt – Gesamtzeitraum", combinedFilePath)
 
 	fmt.Println("\nAlle Diagramme erfolgreich generiert.")
 }
