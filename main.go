@@ -13,6 +13,8 @@ func main() {
 		// add more later
 	case "time_to_usage":
 		diagramsOfTimeToUsage()
+	case "predictions":
+		diagramsPrediction()
 	case "questions":
 		diagramsOfQuestions()
 	}
