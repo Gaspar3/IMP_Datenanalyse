@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"sort"
-	"time"
 
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
@@ -16,218 +15,259 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// ── Lineare Regression (OLS) ──────────────────────────────────────────────────
+// ── Forecast-specific types ────────────────────────────────────────────────
 
-type RegressionModel struct {
-	slope     float64
-	intercept float64
+// ForecastPoint holds a single x/y prediction with a confidence band.
+type ForecastPoint struct {
+	X, YMin, YAvg, YMax float64
 }
 
-func linearRegression(xs, ys []float64) RegressionModel {
+// linearRegression returns slope and intercept for the given (x, y) pairs.
+func linearRegression(xs, ys []float64) (slope, intercept float64) {
 	n := float64(len(xs))
 	if n == 0 {
-		return RegressionModel{}
+		return 0, 0
 	}
-	var sumX, sumY, sumXY, sumXX float64
+	var sumX, sumY, sumXX, sumXY float64
 	for i := range xs {
 		sumX += xs[i]
 		sumY += ys[i]
-		sumXY += xs[i] * ys[i]
 		sumXX += xs[i] * xs[i]
+		sumXY += xs[i] * ys[i]
 	}
 	denom := n*sumXX - sumX*sumX
 	if denom == 0 {
-		return RegressionModel{intercept: sumY / n}
+		return 0, sumY / n
 	}
-	slope := (n*sumXY - sumX*sumY) / denom
-	intercept := (sumY - slope*sumX) / n
-	return RegressionModel{slope, intercept}
+	slope = (n*sumXY - sumX*sumY) / denom
+	intercept = (sumY - slope*sumX) / n
+	return
 }
 
-func (m RegressionModel) predict(x float64) float64 {
-	v := m.slope*x + m.intercept
-	if v < 0 {
-		return 0
-	}
-	return v
-}
-
-// residuals → stddev für Konfidenzband
-func residualStddev(xs, ys []float64, m RegressionModel) float64 {
+// residualStdDev returns the standard deviation of residuals around the regression line.
+func residualStdDev(xs, ys []float64, slope, intercept float64) float64 {
 	if len(xs) < 2 {
 		return 0
 	}
 	var sumSq float64
 	for i := range xs {
-		diff := ys[i] - m.predict(xs[i])
+		diff := ys[i] - (slope*xs[i] + intercept)
 		sumSq += diff * diff
 	}
 	return math.Sqrt(sumSq / float64(len(xs)-1))
 }
 
-// ── Hilfsfunktionen ───────────────────────────────────────────────────────────
-
-// xValues und yValues aus MonthlyData für eine Series extrahieren
-func seriesXY(data []MonthlyData, s Series) ([]float64, []float64) {
-	xs := make([]float64, len(data))
-	ys := make([]float64, len(data))
-	for i, d := range data {
-		xs[i] = monthKeyToFloat(d.MonthKey)
-		ys[i] = s.getter(d)
+// buildForecast creates 12 monthly forecast points for the year following the
+// training data. sigma multipliers: min = −1σ, avg = 0, max = +1σ.
+func buildForecast(data []MonthlyData, getter func(MonthlyData) float64, forecastYear int) []ForecastPoint {
+	var xs, ys []float64
+	for _, d := range data {
+		xs = append(xs, monthKeyToFloat(d.MonthKey))
+		ys = append(ys, getter(d))
 	}
-	return xs, ys
-}
+	slope, intercept := linearRegression(xs, ys)
+	sigma := residualStdDev(xs, ys, slope, intercept)
 
-// Vorhersage-XYs über einen x-Bereich erzeugen
-func predictionLine(model RegressionModel, xMin, xMax float64, steps int) plotter.XYs {
-	pts := make(plotter.XYs, steps)
-	for i := range pts {
-		x := xMin + (xMax-xMin)*float64(i)/float64(steps-1)
-		pts[i] = plotter.XY{X: x, Y: model.predict(x)}
+	var pts []ForecastPoint
+	for month := 1; month <= 12; month++ {
+		x := float64(forecastYear) + float64(month-1)/12.0
+		yAvg := slope*x + intercept
+		if yAvg < 0 {
+			yAvg = 0
+		}
+		yMin := math.Max(0, yAvg-sigma)
+		yMax := yAvg + sigma
+		pts = append(pts, ForecastPoint{X: x, YMin: yMin, YAvg: yAvg, YMax: yMax})
 	}
 	return pts
 }
 
-// Konfidenz-Polygon (min-Band unten, max-Band oben)
-func confidenceBand(model RegressionModel, stddev, xMin, xMax float64, steps int) plotter.XYs {
-	upper := make(plotter.XYs, steps)
-	lower := make(plotter.XYs, steps)
-	for i := range upper {
-		x := xMin + (xMax-xMin)*float64(i)/float64(steps-1)
-		y := model.predict(x)
-		upper[i] = plotter.XY{X: x, Y: math.Max(0, y+stddev)}
-		lower[i] = plotter.XY{X: x, Y: math.Max(0, y-stddev)}
+// ── Tick helpers (reuse from original file) ───────────────────────────────
+
+func fcMonthKeyToFloat(mk int) float64       { return monthKeyToFloat(mk) }
+func fcMonthKeyToLabel(mk int) string         { return monthKeyToMonthLabel(mk) }
+
+func buildForecastMonthTicks(baseYear, forecastYear int) []plot.Tick {
+	var ticks []plot.Tick
+	months := []string{"", "Jan", "Feb", "Mär", "Apr", "Mai", "Jun",
+		"Jul", "Aug", "Sep", "Okt", "Nov", "Dez"}
+	// actual year months
+	for m := 1; m <= 12; m++ {
+		mk := baseYear*100 + m
+		ticks = append(ticks, plot.Tick{
+			Value: monthKeyToFloat(mk),
+			Label: months[m],
+		})
 	}
-	// Polygon: oben vorwärts + unten rückwärts
-	poly := make(plotter.XYs, 2*steps)
-	copy(poly[:steps], upper)
-	for i := 0; i < steps; i++ {
-		poly[steps+i] = lower[steps-1-i]
+	// forecast year months
+	for m := 1; m <= 12; m++ {
+		mk := forecastYear*100 + m
+		ticks = append(ticks, plot.Tick{
+			Value: monthKeyToFloat(mk),
+			Label: months[m],
+		})
 	}
-	return poly
+	return ticks
 }
 
-// aktuelles Jahr
-func currentYear() int {
-	return time.Now().Year()
+func buildAlltimeForecastTicks(allData []MonthlyData, forecastYear int) []plot.Tick {
+	ticks := buildYearTicks(allData)
+	ticks = append(ticks, plot.Tick{
+		Value: float64(forecastYear),
+		Label: fmt.Sprintf("%d*", forecastYear),
+	})
+	return ticks
 }
 
-// ── Einzelner Prognose-Plot ───────────────────────────────────────────────────
-// trainData  = Daten auf denen die Regression basiert
-// compareData = nil  → reines Forecast-Jahr
-//
-//	≠ nil → bereits vorhandene echte Messwerte im Forecast-Jahr (laufendes/vergangenes Vergleichsjahr)
-func savePredictionPlot(
-	trainData []MonthlyData,
-	compareData []MonthlyData, // nil wenn kein Vergleich
+// ── Forecast colors ───────────────────────────────────────────────────────
+
+var (
+	colorForecastMin  = color.RGBA{R: 52, G: 168, B: 83, A: 255}   // green
+	colorForecastAvg  = color.RGBA{R: 66, G: 133, B: 244, A: 255}  // blue
+	colorForecastMax  = color.RGBA{R: 234, G: 67, B: 53, A: 255}   // red
+	colorActualCompare = color.RGBA{R: 0, G: 0, B: 0, A: 200}      // near-black
+	colorBand         = color.RGBA{R: 66, G: 133, B: 244, A: 40}   // transparent fill
+)
+
+// ── Plot helpers ──────────────────────────────────────────────────────────
+
+// addForecastBand draws a filled polygon between the min and max forecast lines.
+func addForecastBand(p *plot.Plot, pts []ForecastPoint) {
+	poly := make(plotter.XYs, 2*len(pts))
+	for i, fp := range pts {
+		poly[i] = plotter.XY{X: fp.X, Y: fp.YMax}
+	}
+	for i, fp := range pts {
+		poly[len(pts)+i] = plotter.XY{X: pts[len(pts)-1-i].X, Y: fp.YMin}
+	}
+	// reverse the bottom half so the polygon closes correctly
+	for i, j := len(pts), 2*len(pts)-1; i < j; i, j = i+1, j-1 {
+		poly[i], poly[j] = poly[j], poly[i]
+	}
+	polygon, err := plotter.NewPolygon(poly)
+	if err != nil {
+		return
+	}
+	polygon.Color = colorBand
+	polygon.LineStyle.Width = 0
+	p.Add(polygon)
+}
+
+func forecastToXYs(pts []ForecastPoint, pick func(ForecastPoint) float64) plotter.XYs {
+	xys := make(plotter.XYs, len(pts))
+	for i, fp := range pts {
+		xys[i] = plotter.XY{X: fp.X, Y: pick(fp)}
+	}
+	return xys
+}
+
+func newForecastLine(pts []ForecastPoint, pick func(ForecastPoint) float64, c color.RGBA, dash bool) *plotter.Line {
+	line, err := plotter.NewLine(forecastToXYs(pts, pick))
+	if err != nil {
+		log.Fatal(err)
+	}
+	line.Color = c
+	line.Width = vg.Points(1.8)
+	if dash {
+		line.Dashes = []vg.Length{vg.Points(5), vg.Points(3)}
+	}
+	return line
+}
+
+// ── Single-series forecast plot ───────────────────────────────────────────
+
+// saveForecastSinglePlot draws one series' actual data for baseYear plus
+// forecast lines for forecastYear. If actualNextData is non-nil, a "real"
+// comparison line is also drawn.
+func saveForecastSinglePlot(
+	baseData []MonthlyData,
+	actualNextData []MonthlyData, // nil when not yet available
 	s Series,
+	forecastPts []ForecastPoint,
 	ticks []plot.Tick,
-	forecastXMin, forecastXMax float64,
 	title, filePath string,
 ) {
 	p := plot.New()
 	p.Title.Text = title
-	p.Title.TextStyle.Font.Size = vg.Points(14)
+	p.Title.TextStyle.Font.Size = vg.Points(15)
 	p.X.Label.Text = "Zeit"
 	p.Y.Label.Text = "Verbrauch (kWh)"
 	p.Add(plotter.NewGrid())
 	p.X.Tick.Marker = plot.ConstantTicks(ticks)
 
-	xs, ys := seriesXY(trainData, s)
-	model := linearRegression(xs, ys)
-	stddev := residualStddev(xs, ys, model)
-
-	const steps = 120
-
-	// ── Konfidenzband ──
-	bandPoly := confidenceBand(model, stddev, forecastXMin, forecastXMax, steps)
-	polygon, err := plotter.NewPolygon(bandPoly)
+	// Actual base-year line
+	basePts := make(plotter.XYs, len(baseData))
+	for i, d := range baseData {
+		basePts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: s.getter(d)}
+	}
+	actualLine, err := plotter.NewLine(basePts)
 	if err != nil {
 		log.Fatal(err)
 	}
-	bandColor := s.color
-	bandColor.A = 50
-	polygon.Color = bandColor
-	polygon.LineStyle.Width = 0
-	p.Add(polygon)
+	actualLine.Color = s.color
+	actualLine.Width = vg.Points(2)
+	p.Add(actualLine)
+	p.Legend.Add("Ist", actualLine)
 
-	// ── Prognose-Linie ──
-	predPts := predictionLine(model, forecastXMin, forecastXMax, steps)
-	predLine, err := plotter.NewLine(predPts)
-	if err != nil {
-		log.Fatal(err)
-	}
-	predLine.Color = s.color
-	predLine.Width = vg.Points(2)
-	predLine.Dashes = []vg.Length{vg.Points(8), vg.Points(4)}
-	p.Add(predLine)
-	p.Legend.Add("Prognose", predLine)
+	// Forecast band + lines
+	addForecastBand(p, forecastPts)
 
-	// ── Trainingsdaten als Punkte + Linie ──
-	trainPts := make(plotter.XYs, len(trainData))
-	for i, d := range trainData {
-		trainPts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: s.getter(d)}
-	}
-	trainLine, err := plotter.NewLine(trainPts)
-	if err != nil {
-		log.Fatal(err)
-	}
-	trainLine.Color = color.RGBA{R: 120, G: 120, B: 120, A: 200}
-	trainLine.Width = vg.Points(1.2)
-	p.Add(trainLine)
-	p.Legend.Add("Historisch", trainLine)
+	minLine := newForecastLine(forecastPts, func(f ForecastPoint) float64 { return f.YMin }, colorForecastMin, true)
+	avgLine := newForecastLine(forecastPts, func(f ForecastPoint) float64 { return f.YAvg }, colorForecastAvg, false)
+	maxLine := newForecastLine(forecastPts, func(f ForecastPoint) float64 { return f.YMax }, colorForecastMax, true)
+	p.Add(minLine, avgLine, maxLine)
+	p.Legend.Add("Prognose Min", minLine)
+	p.Legend.Add("Prognose Avg", avgLine)
+	p.Legend.Add("Prognose Max", maxLine)
 
-	// ── Vergleichsdaten (echte Werte im Prognosezeitraum) ──
-	if len(compareData) > 0 {
-		cmpPts := make(plotter.XYs, len(compareData))
-		for i, d := range compareData {
-			cmpPts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: s.getter(d)}
+	// Comparison line (actual data for forecast year)
+	if len(actualNextData) > 0 {
+		nextPts := make(plotter.XYs, len(actualNextData))
+		for i, d := range actualNextData {
+			nextPts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: s.getter(d)}
 		}
-		cmpLine, err := plotter.NewLine(cmpPts)
+		nextLine, err := plotter.NewLine(nextPts)
 		if err != nil {
 			log.Fatal(err)
 		}
-		cmpLine.Color = color.RGBA{R: 220, G: 50, B: 50, A: 255}
-		cmpLine.Width = vg.Points(2)
-		p.Add(cmpLine)
-		p.Legend.Add("Ist-Werte", cmpLine)
-
-		// Scatter-Punkte für Ist-Werte
-		scatter, err := plotter.NewScatter(cmpPts)
-		if err != nil {
-			log.Fatal(err)
-		}
-		scatter.GlyphStyle.Color = color.RGBA{R: 220, G: 50, B: 50, A: 255}
-		scatter.GlyphStyle.Radius = vg.Points(3)
-		p.Add(scatter)
+		nextLine.Color = colorActualCompare
+		nextLine.Width = vg.Points(2)
+		nextLine.Dashes = []vg.Length{vg.Points(8), vg.Points(4)}
+		p.Add(nextLine)
+		p.Legend.Add("Tatsächlich (Folgejahr)", nextLine)
 	}
 
 	p.Legend.Top = true
-	p.Legend.Left = true
+	p.Legend.Left = false
 	p.Legend.TextStyle.Font.Size = vg.Points(9)
 
-	// Y-Achse sinnvoll skalieren
-	allYs := ys
-	for _, d := range compareData {
-		allYs = append(allYs, s.getter(d))
-	}
-	maxY := 0.0
-	for _, v := range allYs {
-		if v > maxY {
-			maxY = v
+	// Y axis range
+	maxVal := 0.0
+	for _, pt := range forecastPts {
+		if pt.YMax > maxVal {
+			maxVal = pt.YMax
 		}
 	}
-	// Prognose-Max mit einbeziehen
-	for _, pt := range predPts {
-		if pt.Y > maxY {
-			maxY = pt.Y
+	for _, d := range baseData {
+		if v := s.getter(d); v > maxVal {
+			maxVal = v
 		}
 	}
-	if maxY == 0 {
-		maxY = 100
+	if len(actualNextData) > 0 {
+		for _, d := range actualNextData {
+			if v := s.getter(d); v > maxVal {
+				maxVal = v
+			}
+		}
+	}
+	if maxVal == 0 {
+		maxVal = 100
 	}
 	p.Y.Min = 0
-	p.Y.Max = math.Ceil(maxY/500) * 500 * 1.1
+	p.Y.Max = math.Ceil(maxVal/1000) * 1000
+	if p.Y.Max == 0 {
+		p.Y.Max = maxVal * 1.1
+	}
 
 	if err := p.Save(20*vg.Centimeter, 12*vg.Centimeter, filePath); err != nil {
 		log.Fatal(err)
@@ -235,55 +275,132 @@ func savePredictionPlot(
 	fmt.Println("Gespeichert:", filePath)
 }
 
-// ── Kombinierter gestapelter Prognose-Plot (alle Series) ─────────────────────
-func saveCombinedPredictionPlot(
-	trainData []MonthlyData,
-	compareData []MonthlyData,
+// ── All-series overlay forecast plot ─────────────────────────────────────
+
+func saveForecastAllSeriesPlot(
+	baseData []MonthlyData,
+	actualNextData []MonthlyData,
 	seriesList []Series,
+	forecastMap map[string][]ForecastPoint,
 	ticks []plot.Tick,
-	forecastXMin, forecastXMax float64,
 	title, filePath string,
 ) {
 	p := plot.New()
 	p.Title.Text = title
-	p.Title.TextStyle.Font.Size = vg.Points(14)
+	p.Title.TextStyle.Font.Size = vg.Points(15)
+	p.X.Label.Text = "Zeit"
+	p.Y.Label.Text = "Verbrauch (kWh)"
+	p.Add(plotter.NewGrid())
+	p.X.Tick.Marker = plot.ConstantTicks(ticks)
+
+	maxVal := 0.0
+
+	for _, s := range seriesList {
+		// Actual
+		basePts := make(plotter.XYs, len(baseData))
+		for i, d := range baseData {
+			basePts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: s.getter(d)}
+			if s.getter(d) > maxVal {
+				maxVal = s.getter(d)
+			}
+		}
+		actualLine, err := plotter.NewLine(basePts)
+		if err != nil {
+			log.Fatal(err)
+		}
+		actualLine.Color = s.color
+		actualLine.Width = vg.Points(1.5)
+		p.Add(actualLine)
+		p.Legend.Add(s.name+" Ist", actualLine)
+
+		// Forecast avg only (keep chart readable)
+		fps := forecastMap[s.id]
+		avgLine := newForecastLine(fps, func(f ForecastPoint) float64 { return f.YAvg }, s.color, true)
+		p.Add(avgLine)
+		p.Legend.Add(s.name+" Prog.", avgLine)
+		for _, fp := range fps {
+			if fp.YMax > maxVal {
+				maxVal = fp.YMax
+			}
+		}
+	}
+
+	// Actual next-year data per series
+	if len(actualNextData) > 0 {
+		for _, s := range seriesList {
+			nextPts := make(plotter.XYs, len(actualNextData))
+			for i, d := range actualNextData {
+				nextPts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: s.getter(d)}
+				if s.getter(d) > maxVal {
+					maxVal = s.getter(d)
+				}
+			}
+			nextLine, err := plotter.NewLine(nextPts)
+			if err != nil {
+				log.Fatal(err)
+			}
+			c := s.color
+			c.A = 120
+			nextLine.Color = c
+			nextLine.Width = vg.Points(1.2)
+			nextLine.Dashes = []vg.Length{vg.Points(8), vg.Points(4)}
+			p.Add(nextLine)
+		}
+	}
+
+	p.Legend.Top = true
+	p.Legend.Left = false
+	p.Legend.TextStyle.Font.Size = vg.Points(7)
+
+	p.Y.Min = 0
+	if maxVal == 0 {
+		maxVal = 100
+	}
+	p.Y.Max = math.Ceil(maxVal/1000) * 1000
+
+	if err := p.Save(20*vg.Centimeter, 12*vg.Centimeter, filePath); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Gespeichert:", filePath)
+}
+
+// ── Stacked forecast plot ─────────────────────────────────────────────────
+
+func saveForecastCombinedPlot(
+	baseData []MonthlyData,
+	actualNextData []MonthlyData,
+	seriesList []Series,
+	forecastMap map[string][]ForecastPoint,
+	ticks []plot.Tick,
+	title, filePath string,
+) {
+	p := plot.New()
+	p.Title.Text = title
+	p.Title.TextStyle.Font.Size = vg.Points(15)
 	p.X.Label.Text = "Zeit"
 	p.Y.Label.Text = "Gesamtverbrauch (kWh)"
 	p.Add(plotter.NewGrid())
 	p.X.Tick.Marker = plot.ConstantTicks(ticks)
 
-	const steps = 120
+	nFc := 12 // months in forecast year
 
-	// Für gestapelte Prognose: kumulierte Oberkante
-	cumulPred := make([]float64, steps)
-	cumulBandHi := make([]float64, steps)
-	cumulBandLo := make([]float64, steps)
-	predXs := make([]float64, steps)
-	for i := range predXs {
-		predXs[i] = forecastXMin + (forecastXMax-forecastXMin)*float64(i)/float64(steps-1)
+	// ── Stacked actual (base year) ────────────────────────────────────────
+	cumBase := make([]float64, len(baseData))
+	prevBase := make(plotter.XYs, len(baseData))
+	for i, d := range baseData {
+		prevBase[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: 0}
 	}
 
-	prevLayer := make(plotter.XYs, steps)
-
 	for _, s := range seriesList {
-		xs, ys := seriesXY(trainData, s)
-		model := linearRegression(xs, ys)
-		stddev := residualStddev(xs, ys, model)
-
-		// Kumulierte Prognose-Schicht aufbauen
-		layer := make(plotter.XYs, steps)
-		for i, x := range predXs {
-			cumulPred[i] += model.predict(x)
-			cumulBandHi[i] += math.Max(0, model.predict(x)+stddev)
-			cumulBandLo[i] += math.Max(0, model.predict(x)-stddev)
-			layer[i] = plotter.XY{X: x, Y: cumulPred[i]}
+		layer := make(plotter.XYs, len(baseData))
+		for i, d := range baseData {
+			cumBase[i] += s.getter(d)
+			layer[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: cumBase[i]}
 		}
-
-		// Polygon zwischen prevLayer und layer
-		poly := make(plotter.XYs, 2*steps)
-		copy(poly[:steps], layer)
-		for i := 0; i < steps; i++ {
-			poly[steps+i] = prevLayer[steps-1-i]
+		poly := make(plotter.XYs, 2*len(baseData))
+		copy(poly, layer)
+		for i := range baseData {
+			poly[len(baseData)+i] = prevBase[len(baseData)-1-i]
 		}
 		polygon, err := plotter.NewPolygon(poly)
 		if err != nil {
@@ -295,85 +412,142 @@ func saveCombinedPredictionPlot(
 		polygon.LineStyle.Width = 0
 		p.Add(polygon)
 
-		line, err := plotter.NewLine(layer)
+		borderLine, err := plotter.NewLine(layer)
 		if err != nil {
 			log.Fatal(err)
 		}
-		line.Color = s.color
-		line.Width = vg.Points(1)
-		line.Dashes = []vg.Length{vg.Points(6), vg.Points(3)}
-		p.Add(line)
-		p.Legend.Add(s.name+" (Prog.)", line)
+		borderLine.Color = s.color
+		borderLine.Width = vg.Points(0.8)
+		p.Add(borderLine)
+		p.Legend.Add(s.name, borderLine)
 
-		copy(prevLayer, layer)
+		copy(prevBase, layer)
 	}
 
-	// Gesamt-Prognose-Linie (gestrichelt, schwarz)
-	totalPredPts := make(plotter.XYs, steps)
-	for i, x := range predXs {
-		totalPredPts[i] = plotter.XY{X: x, Y: cumulPred[i]}
+	// ── Stacked forecast avg ──────────────────────────────────────────────
+	cumFcAvg := make([]float64, nFc)
+	prevFcAvg := make(plotter.XYs, nFc)
+	for i, fp := range forecastMap[seriesList[0].id] {
+		prevFcAvg[i] = plotter.XY{X: fp.X, Y: 0}
 	}
-	totalLine, err := plotter.NewLine(totalPredPts)
+
+	for _, s := range seriesList {
+		fps := forecastMap[s.id]
+		layer := make(plotter.XYs, nFc)
+		for i, fp := range fps {
+			cumFcAvg[i] += fp.YAvg
+			layer[i] = plotter.XY{X: fp.X, Y: cumFcAvg[i]}
+		}
+		poly := make(plotter.XYs, 2*nFc)
+		copy(poly, layer)
+		for i := range fps {
+			poly[nFc+i] = prevFcAvg[nFc-1-i]
+		}
+		polygon, err := plotter.NewPolygon(poly)
+		if err != nil {
+			log.Fatal(err)
+		}
+		c := s.color
+		c.A = 80
+		polygon.Color = c
+		polygon.LineStyle.Width = 0
+		p.Add(polygon)
+
+		borderLine, err := plotter.NewLine(layer)
+		if err != nil {
+			log.Fatal(err)
+		}
+		borderLine.Color = s.color
+		borderLine.Width = vg.Points(0.8)
+		borderLine.Dashes = []vg.Length{vg.Points(5), vg.Points(3)}
+		p.Add(borderLine)
+
+		copy(prevFcAvg, layer)
+	}
+
+	// Total actual + total forecast avg dashed
+	totalBase := make(plotter.XYs, len(baseData))
+	for i := range baseData {
+		totalBase[i] = prevBase[i]
+	}
+	totalLine, err := plotter.NewLine(totalBase)
 	if err != nil {
 		log.Fatal(err)
 	}
 	totalLine.Color = color.RGBA{0, 0, 0, 255}
 	totalLine.Width = vg.Points(2)
-	totalLine.Dashes = []vg.Length{vg.Points(8), vg.Points(4)}
 	p.Add(totalLine)
-	p.Legend.Add("Gesamt Prognose", totalLine)
+	p.Legend.Add("Gesamt Ist", totalLine)
 
-	// ── Konfidenzband Gesamt ──
-	bandPoly := make(plotter.XYs, 2*steps)
-	for i, x := range predXs {
-		bandPoly[i] = plotter.XY{X: x, Y: cumulBandHi[i]}
+	totalFc := make(plotter.XYs, nFc)
+	for i := range prevFcAvg {
+		totalFc[i] = prevFcAvg[i]
 	}
-	for i := range predXs {
-		bandPoly[steps+i] = plotter.XY{X: predXs[steps-1-i], Y: cumulBandLo[steps-1-i]}
-	}
-	bandPolygon, err := plotter.NewPolygon(bandPoly)
+	totalFcLine, err := plotter.NewLine(totalFc)
 	if err != nil {
 		log.Fatal(err)
 	}
-	bandPolygon.Color = color.RGBA{180, 180, 180, 60}
-	bandPolygon.LineStyle.Width = 0
-	p.Add(bandPolygon)
+	totalFcLine.Color = colorForecastAvg
+	totalFcLine.Width = vg.Points(2)
+	totalFcLine.Dashes = []vg.Length{vg.Points(7), vg.Points(4)}
+	p.Add(totalFcLine)
+	p.Legend.Add("Gesamt Prognose", totalFcLine)
 
-	// ── Ist-Werte Gesamt (Summe aller Series) ──
-	if len(compareData) > 0 {
-		cmpPts := make(plotter.XYs, len(compareData))
-		for i, d := range compareData {
-			var total float64
-			for _, s := range seriesList {
-				total += s.getter(d)
+	// Optional actual next-year stacked total
+	if len(actualNextData) > 0 {
+		cumNext := make([]float64, len(actualNextData))
+		for _, s := range seriesList {
+			for i, d := range actualNextData {
+				cumNext[i] += s.getter(d)
 			}
-			cmpPts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: total}
 		}
-		cmpLine, err := plotter.NewLine(cmpPts)
+		nextTotalPts := make(plotter.XYs, len(actualNextData))
+		for i, d := range actualNextData {
+			nextTotalPts[i] = plotter.XY{X: monthKeyToFloat(d.MonthKey), Y: cumNext[i]}
+		}
+		nextTotalLine, err := plotter.NewLine(nextTotalPts)
 		if err != nil {
 			log.Fatal(err)
 		}
-		cmpLine.Color = color.RGBA{220, 50, 50, 255}
-		cmpLine.Width = vg.Points(2)
-		p.Add(cmpLine)
-		p.Legend.Add("Ist-Gesamt", cmpLine)
+		nextTotalLine.Color = colorActualCompare
+		nextTotalLine.Width = vg.Points(2)
+		nextTotalLine.Dashes = []vg.Length{vg.Points(9), vg.Points(5)}
+		p.Add(nextTotalLine)
+		p.Legend.Add("Gesamt Tatsächlich", nextTotalLine)
 	}
 
 	p.Legend.Top = true
-	p.Legend.Left = true
+	p.Legend.Left = false
 	p.Legend.TextStyle.Font.Size = vg.Points(8)
 
-	maxY := 0.0
-	for _, v := range cumulBandHi {
-		if v > maxY {
-			maxY = v
+	// Y max
+	maxTotal := 0.0
+	for _, pt := range totalBase {
+		if pt.Y > maxTotal {
+			maxTotal = pt.Y
 		}
 	}
-	if maxY == 0 {
-		maxY = 1000
+	for _, pt := range totalFc {
+		if pt.Y > maxTotal {
+			maxTotal = pt.Y
+		}
+	}
+	if len(actualNextData) > 0 {
+		cumChk := 0.0
+		for _, s := range seriesList {
+			for _, d := range actualNextData {
+				cumChk += s.getter(d)
+			}
+		}
+		if cumChk > maxTotal {
+			maxTotal = cumChk
+		}
+	}
+	if maxTotal == 0 {
+		maxTotal = 100
 	}
 	p.Y.Min = 0
-	p.Y.Max = math.Ceil(maxY/1000) * 1000 * 1.1
+	p.Y.Max = math.Ceil(maxTotal/1000) * 1000
 
 	if err := p.Save(20*vg.Centimeter, 12*vg.Centimeter, filePath); err != nil {
 		log.Fatal(err)
@@ -381,9 +555,9 @@ func saveCombinedPredictionPlot(
 	fmt.Println("Gespeichert:", filePath)
 }
 
-// ── Haupt-Einstiegspunkt ──────────────────────────────────────────────────────
+// ── Main entry point ──────────────────────────────────────────────────────
 
-func diagramsPrediction() {
+func diagramsOfForecasts() {
 	db, err := sql.Open("sqlite", "assets/data/datenbank.db")
 	if err != nil {
 		log.Fatal(err)
@@ -426,7 +600,7 @@ func diagramsPrediction() {
 		{"s_bhkw", "Strom BHKW", func(d MonthlyData) float64 { return d.SBhkw }, color.RGBA{R: 188, G: 189, B: 34, A: 255}},
 	}
 
-	// Jahre gruppieren
+	// Group data by year
 	yearDataMap := map[int][]MonthlyData{}
 	for _, d := range allData {
 		y := d.MonthKey / 100
@@ -438,106 +612,88 @@ func diagramsPrediction() {
 	}
 	sort.Ints(years)
 
-	basePath := "assets/diagrams/prediction"
-	now := currentYear()
+	basePath := "assets/diagrams/forecasts"
 
-	// ── Pro Jahr ──────────────────────────────────────────────────────────────
-	for idx, year := range years {
+	// ── Per-year forecast plots ───────────────────────────────────────────
+	for _, year := range years {
+		baseData := yearDataMap[year]
+		forecastYear := year + 1
+
+		// Build forecast map for all series
+		forecastMap := map[string][]ForecastPoint{}
+		for _, s := range seriesList {
+			forecastMap[s.id] = buildForecast(baseData, s.getter, forecastYear)
+		}
+
+		// Actual data for forecast year (may be nil)
+		actualNext := yearDataMap[forecastYear] // nil if not present
+
 		dirPath := fmt.Sprintf("%s/%d", basePath, year)
 		if err := os.MkdirAll(dirPath, 0755); err != nil {
 			log.Fatal(err)
 		}
 
-		// Trainingsdaten = alle Jahre VOR diesem Jahr
-		var trainData []MonthlyData
-		for _, y := range years[:idx] {
-			trainData = append(trainData, yearDataMap[y]...)
-		}
-		if len(trainData) == 0 {
-			// Erstes Jahr: Regression auf sich selbst (kein sinnvoller Prior)
-			// Wir überspringen oder verwenden das Jahr selbst als Training
-			trainData = yearDataMap[year]
-		}
+		ticks := buildForecastMonthTicks(year, forecastYear)
 
-		// Vergleichsdaten: echte Werte des Jahres selbst (laufend oder vergangen)
-		compareData := yearDataMap[year]
-
-		// x-Bereich des Forecast-Jahres: Jan–Dez
-		forecastXMin := monthKeyToFloat(year*100 + 1)
-		forecastXMax := monthKeyToFloat(year*100 + 12)
-
-		// Ticks: Monate des Jahres
-		ticks := buildMonthTicks(yearDataMap[year])
-
-		// Liegt das Jahr in der Zukunft? → kein Vergleich
-		if year > now {
-			compareData = nil
-		}
-
+		// Individual series
 		for _, s := range seriesList {
+			title := fmt.Sprintf("%s – %d + Prognose %d", s.name, year, forecastYear)
 			filePath := fmt.Sprintf("%s/%s.png", dirPath, s.id)
-			var title string
-			if year > now {
-				title = fmt.Sprintf("%s – Prognose %d", s.name, year)
-			} else if year == now {
-				title = fmt.Sprintf("%s – Prognose vs. Ist %d (laufend)", s.name, year)
-			} else {
-				title = fmt.Sprintf("%s – Prognose vs. Ist %d", s.name, year)
-			}
-			savePredictionPlot(trainData, compareData, s, ticks,
-				forecastXMin, forecastXMax, title, filePath)
+			saveForecastSinglePlot(baseData, actualNext, s, forecastMap[s.id], ticks, title, filePath)
 		}
 
-		// Kombinierter gestapelter Plot
-		var combinedTitle string
-		switch {
-		case year > now:
-			combinedTitle = fmt.Sprintf("Gesamtprognose gestapelt – %d", year)
-		case year == now:
-			combinedTitle = fmt.Sprintf("Gesamtprognose vs. Ist gestapelt – %d (laufend)", year)
-		default:
-			combinedTitle = fmt.Sprintf("Gesamtprognose vs. Ist gestapelt – %d", year)
-		}
-		saveCombinedPredictionPlot(trainData, compareData, seriesList, ticks,
-			forecastXMin, forecastXMax, combinedTitle,
-			fmt.Sprintf("%s/combined.png", dirPath))
+		// All series overlay
+		saveForecastAllSeriesPlot(
+			baseData, actualNext, seriesList, forecastMap, ticks,
+			fmt.Sprintf("Alle Zähler – %d + Prognose %d", year, forecastYear),
+			fmt.Sprintf("%s/all.png", dirPath),
+		)
+
+		// Stacked combined
+		saveForecastCombinedPlot(
+			baseData, actualNext, seriesList, forecastMap, ticks,
+			fmt.Sprintf("Gesamtverbrauch gestapelt – %d + Prognose %d", year, forecastYear),
+			fmt.Sprintf("%s/combined.png", dirPath),
+		)
 	}
 
-	// ── Alltime-Prognose ──────────────────────────────────────────────────────
+	// ── Alltime forecast plots ────────────────────────────────────────────
+	lastYear := years[len(years)-1]
+	forecastYear := lastYear + 1
+
+	forecastMap := map[string][]ForecastPoint{}
+	for _, s := range seriesList {
+		forecastMap[s.id] = buildForecast(allData, s.getter, forecastYear)
+	}
+
 	alltimePath := fmt.Sprintf("%s/alltime", basePath)
 	if err := os.MkdirAll(alltimePath, 0755); err != nil {
 		log.Fatal(err)
 	}
 
-	// Trainingsdaten = alle vorhanden Daten
-	// Forecast-Bereich: letztes bekanntes Jahr +1 und +2
-	lastYear := years[len(years)-1]
-	forecastStart := monthKeyToFloat(lastYear*100+1) // Beginn letztes Jahr als Ankerpunkt
-	forecastEnd := monthKeyToFloat((lastYear+2)*100 + 12)
+	alltimeTicks := buildAlltimeForecastTicks(allData, forecastYear)
 
-	// Alltime-Ticks: Jahre + Forecast-Jahre
-	alltimeTicks := buildYearTicks(allData)
-	for _, fy := range []int{lastYear + 1, lastYear + 2} {
-		alltimeTicks = append(alltimeTicks, plot.Tick{
-			Value: float64(fy),
-			Label: fmt.Sprintf("%d*", fy),
-		})
-	}
-	sort.Slice(alltimeTicks, func(i, j int) bool {
-		return alltimeTicks[i].Value < alltimeTicks[j].Value
-	})
+	// Build a synthetic 12-point "alltime base" using year totals for the
+	// alltime chart, so the x-axis aligns with the year ticks.
+	// We pass allData directly; monthKeyToFloat handles the float mapping.
 
 	for _, s := range seriesList {
+		title := fmt.Sprintf("%s – Gesamtzeitraum + Prognose %d", s.name, forecastYear)
 		filePath := fmt.Sprintf("%s/%s.png", alltimePath, s.id)
-		title := fmt.Sprintf("%s – Gesamtzeitraum + Prognose", s.name)
-		savePredictionPlot(allData, nil, s, alltimeTicks,
-			forecastStart, forecastEnd, title, filePath)
+		saveForecastSinglePlot(allData, nil, s, forecastMap[s.id], alltimeTicks, title, filePath)
 	}
 
-	saveCombinedPredictionPlot(allData, nil, seriesList, alltimeTicks,
-		forecastStart, forecastEnd,
-		"Gesamtverbrauch gestapelt – Gesamtzeitraum + Prognose",
-		fmt.Sprintf("%s/combined.png", alltimePath))
+	saveForecastAllSeriesPlot(
+		allData, nil, seriesList, forecastMap, alltimeTicks,
+		fmt.Sprintf("Alle Zähler – Gesamtzeitraum + Prognose %d", forecastYear),
+		fmt.Sprintf("%s/all.png", alltimePath),
+	)
+
+	saveForecastCombinedPlot(
+		allData, nil, seriesList, forecastMap, alltimeTicks,
+		fmt.Sprintf("Gesamtverbrauch gestapelt – Gesamtzeitraum + Prognose %d", forecastYear),
+		fmt.Sprintf("%s/combined.png", alltimePath),
+	)
 
 	fmt.Println("\nAlle Prognose-Diagramme erfolgreich generiert.")
 }

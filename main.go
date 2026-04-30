@@ -14,7 +14,7 @@ func main() {
 	case "time_to_usage":
 		diagramsOfTimeToUsage()
 	case "predictions":
-		diagramsPrediction()
+		diagramsOfForecasts()
 	case "questions":
 		diagramsOfQuestions()
 	}
